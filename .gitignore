@@ -1,0 +1,24 @@
+# Android Studio
+.idea/
+*.iml
+.DS_Store
+local.properties
+
+# Build outputs
+build/
+app/build/
+
+# Gradle
+.gradle/
+gradle-wrapper.jar
+
+# Keystore files
+*.jks
+*.keystore
+
+# Python
+__pycache__/
+*.pyc
+*.db
+session_data.db
+.env

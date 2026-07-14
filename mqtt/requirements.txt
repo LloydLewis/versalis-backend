@@ -1,0 +1,2 @@
+paho-mqtt>=2.0.0
+# sqlite3 is part of Python's standard library - no external install needed
