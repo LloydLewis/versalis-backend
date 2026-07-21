@@ -7,12 +7,13 @@ import com.hivemq.client.mqtt.mqtt3.message.publish.Mqtt3Publish
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.nio.charset.StandardCharsets
 
 class BioDataSubscriber(
     private val repository: BioDataRepository
 ) {
-    private val topic = "sensor/heartrate"
+    private val topic = "sensor/biometric"
 
     // 10.0.2.2 = localhost on your PC from the Android emulator
     private val client: Mqtt3AsyncClient = MqttClient.builder()
@@ -56,15 +57,17 @@ class BioDataSubscriber(
     }
 
     private fun handleMessage(payload: String) {
-        println("Received: $payload bpm")
+        println("Received biometric payload")
 
         try {
-            val bpm = payload.trim().toInt()
-            val timestamp = System.currentTimeMillis()
+            val json = JSONObject(payload)
 
             CoroutineScope(Dispatchers.IO).launch {
-                repository.writeBioData(bpm, timestamp)
-                println("Written to Realm - BPM: $bpm")
+                repository.writeBiometricReading(json)
+                println("Written to Realm - " +
+                        "Session: ${json.getString("sessionId")} | " +
+                        "HR: ${json.getDouble("heartRateBpm")} | " +
+                        "Anxiety: ${json.getDouble("anxietyScore")}")
             }
 
         } catch (e: Exception) {
