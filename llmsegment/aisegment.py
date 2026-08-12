@@ -8,14 +8,15 @@ GUARD_MODEL = "llama-guard3:1b"
 ollama_url = "http://localhost:11434/api/chat"
 
 system_prompt = (
-    "You are a warm, present clinical therapist in a VR session. "
-    "Respond the way a human therapist speaks out loud: ONE short sentence only. "
+    "You are a warm, present clinical therapist in a VR session, speaking out loud in real time. "
+    "Talk the way a real therapist talks in person. "
+    "never a list or a paragraph. "
     "Take the patient's stated feelings at face value — do not contradict, "
     "reinterpret, or suggest they feel differently than what they said. "
     "If the patient asks for space or says they don't want to talk, respect that "
     "immediately and let them lead — do not press further or re-open the topic. "
-    "Be deeply conversational, with no lists, no explanations, and no paragraphs. "
     "Maintain strict professional boundaries, and never give a medical diagnosis."
+    "You are a Real Human Therapist and talk like one and never mention that you are virtual or a computer, you are totally and entirely human to them."
 )
 
 SELF_HARM_RE = re.compile(
@@ -26,13 +27,29 @@ SELF_HARM_RE = re.compile(
 CLINICIAN_OVERRIDE_MESSAGE = "I'm right here with you, and I'm getting your care team connected now."
 SAFE_FALLBACK_MESSAGE = "Let's pause for a moment — I'm here whenever you're ready."
 
-# Generation options tuned for speed + single-sentence brevity
-GEN_OPTIONS = {
-    "num_predict": 40,          # hard cap so it can't ramble even if it misses the stop token
-    "temperature": 0.6,
-    "stop": [".", "!", "?"],    # stop at the first sentence-ending punctuation
-    "num_ctx": 1024,            # smaller context window = faster prompt processing per turn
-}
+def compute_gen_options(user_text: str) -> dict:
+    """
+    Scales the model's response budget to the patient's input, instead of
+    using one fixed number for every turn — this is what actually makes
+    replies feel proportionate, the way a human adjusts a one-word reply
+    for "im fine" vs a longer one for something the patient opened up about.
+
+    num_predict is a TOKEN budget, not a sentence count — it's a ceiling,
+    not a target. The model can (and usually will) stop earlier on its own.
+    We still cap it because an ungoverned local model can occasionally
+    ramble into a paragraph, which is both a latency and a safety risk here.
+    """
+    word_count = len(user_text.split())
+    # short patient input -> short budget, longer input -> a bit more room,
+    # but always clamped so it can never balloon into an essay
+    num_predict = max(20, min(90, word_count * 6))
+
+    return {
+        "num_predict": num_predict,
+        "temperature": 0.6,
+        "stop": ["\n\n"],   # only guard against it drifting into a new paragraph/list
+        "num_ctx": 1024,
+    }
 
 # --- Core Logic ---
 
@@ -57,11 +74,29 @@ def check_llama_guard_verdict(verdict: str) -> tuple[bool, str | None]:
     return False, (lines[1] if len(lines) > 1 else "unknown")
 
 
-def finish_sentence(text: str) -> str:
-    """Ollama's `stop` strings are excluded from output, so re-add closing punctuation."""
-    if text and text[-1] not in ".!?":
-        text += "."
-    return text
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def trim_to_conversational_length(text: str, user_text: str) -> str:
+    """
+    Safety net independent of prompt-following: even if the model ignores
+    instructions and rambles, this guarantees the reply stays human-sized
+    and roughly proportionate to what the patient said, rather than a
+    fixed sentence count for every turn.
+    """
+    text = text.strip()
+    if not text:
+        return text
+
+    # A brief patient message gets at most 1 sentence back; a longer,
+    # more open message allows up to 2 — mirrors natural conversation pacing.
+    max_sentences = 1 if len(user_text.split()) <= 6 else 2
+
+    sentences = [s for s in SENTENCE_SPLIT_RE.split(text) if s]
+    trimmed = " ".join(sentences[:max_sentences]).strip()
+    if trimmed and trimmed[-1] not in ".!?":
+        trimmed += "."
+    return trimmed
 
 
 async def ask_question_async(user_text: str) -> str:
@@ -81,7 +116,7 @@ async def ask_question_async(user_text: str) -> str:
                 client, CHAT_MODEL,
                 [{"role": "system", "content": system_prompt},
                  {"role": "user", "content": user_text}],
-                options=GEN_OPTIONS,
+                options=compute_gen_options(user_text),
             )
         )
 
@@ -92,7 +127,7 @@ async def ask_question_async(user_text: str) -> str:
             print(f"[guardrails] blocked input, category: {input_category}")
             return SAFE_FALLBACK_MESSAGE
 
-        model_reply = finish_sentence(await gen_task)
+        model_reply = trim_to_conversational_length(await gen_task, user_text)
 
         # 3. Output gate — check the model's actual reply before showing it to the patient
         output_verdict = await call_ollama(
