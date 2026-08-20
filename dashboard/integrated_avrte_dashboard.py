@@ -1024,19 +1024,32 @@ def render_setup_or_dashboard() -> None:
 
         with col_mirror:
             st.subheader("Live patient view (mirror)")
-            st.info(
-                "Video mirror placeholder — wire this to the local VR streaming layer's "
-                "preview output (same feed sent to the Quest, mirrored to this browser)."
-            )
-            st.image(
-                np.zeros((240, 426, 3), dtype=np.uint8),
-                caption="Awaiting mirrored stream",
-                use_container_width=True,
-            )
+
+            try:
+                import requests as _req
+                resp = _req.get("http://127.0.0.1:8002/mirror/latest", timeout=1)
+                if resp.status_code == 200:
+                    st.image(
+                        resp.content,
+                        caption="Live VR mirror",
+                        use_container_width=True
+                    )
+                else:
+                    st.image(
+                        np.zeros((240, 426, 3), dtype=np.uint8),
+                        caption="Waiting for VR stream...",
+                        use_container_width=True,
+                    )
+            except Exception:
+                st.image(
+                    np.zeros((240, 426, 3), dtype=np.uint8),
+                    caption="Mirror unavailable — is FastAPI running?",
+                    use_container_width=True,
+                )
 
             st.subheader("Current scenario")
             band = UnrealBridge.INTENSITY_BANDS[st.session_state.bridge.current_band_index]
-            st.metric("Intensity band", band.replace("_", " ").title())
+            st.metric("Intensity band", band.replace("_", " ").title())    
 
         latest = history[-1] if history else {}
 
