@@ -74,4 +74,5 @@ dependencies {
     implementation(libs.ktor.server.content.negotiation)
     implementation(libs.ktor.serialization.kotlinx.json)
     implementation("com.hivemq:hivemq-mqtt-client:1.3.3")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

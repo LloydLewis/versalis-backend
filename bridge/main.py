@@ -5,7 +5,7 @@ Versalis — Connection bridge between Unreal Engine and the clinician dashboard
 Two features:
   1. VR Mirror   — Unreal posts JPEG frames here every 100ms.
                    Dashboard fetches the latest frame every second.
-  2. Encouragement — Dashboard posts a command here.
+  2. Command channel — Dashboard posts a command here.
                      FastAPI forwards it to Unreal via WebSocket.
 
 Run with:
@@ -16,6 +16,7 @@ Port 8002 keeps this separate from the LLM service on 8001.
 
 from __future__ import annotations
 
+import httpx
 import asyncio
 import base64
 import time
@@ -26,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+latest_llm_interaction: Optional[dict] = None
 app = FastAPI(title="Versalis Bridge Service")
 
 # Allow the Streamlit dashboard (running on a different port) to call this API
@@ -112,12 +114,11 @@ class CommandPayload(BaseModel):
     What the dashboard sends to control the Unreal session.
 
     Supported types:
-      show_encouragement  — shows a popup on the headset
       set_intensity       — changes the VR scenario intensity band
       stop_session        — triggers safe session termination
     """
-    type: str                   # "show_encouragement" | "set_intensity" | "stop_session"
-    message: Optional[str] = None   # used by show_encouragement
+    type: str                   # "set_intensity" | "stop_session"
+    message: Optional[str] = None   # free-text payload for future command types
     band: Optional[str] = None      # used by set_intensity: very_low|low|medium|high|very_high
 
 
@@ -226,10 +227,6 @@ async def send_unreal_command(payload: CommandPayload):
 
     Examples:
 
-    Encouragement button clicked:
-        POST /unreal/command
-        {"type": "show_encouragement", "message": "Breathe — you're doing great."}
-
     Intensity lowered:
         POST /unreal/command
         {"type": "set_intensity", "band": "low"}
@@ -267,3 +264,56 @@ async def health():
         "mirror_active": frame_store.age_seconds() < 5.0,
         "frames_received": frame_store.frame_count(),
     }
+
+# =============================================================================
+# SECTION 8 — Biometric data
+# =============================================================================
+
+latest_biometric: Optional[dict] = None
+
+@app.post("/biometric/update")
+async def receive_biometric(payload: dict):
+    """
+    Android app posts latest biometric reading here.
+    Dashboard polls /biometric/latest to display it.
+    """
+    global latest_biometric
+    latest_biometric = payload
+    return {"status": "ok"}
+
+@app.get("/biometric/latest")
+async def get_latest_biometric():
+    """Dashboard polls this every second"""
+    if latest_biometric is None:
+        return Response(status_code=204)
+    return latest_biometric
+
+
+@app.post("/llm/interaction")
+async def receive_llm_interaction(payload: dict):
+    """
+    FastAPI LLM service posts here after every patient/therapist exchange.
+    Bridge forwards to Android app which writes to Realm.
+    Also stores latest interaction in memory for dashboard display.
+    """
+    global latest_llm_interaction
+    latest_llm_interaction = payload
+
+    # Forward to Android app
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            await client.post(
+                "http://10.0.2.2:8080/realm/llm-interaction",  # Kotlin Ktor server
+                json=payload
+            )
+    except Exception as e:
+        print(f"[bridge] Failed to forward to Kotlin: {e}")
+
+    return {"status": "ok"}
+
+@app.get("/llm/latest")
+async def get_latest_llm_interaction():
+    """Dashboard polls this to show the latest exchange"""
+    if latest_llm_interaction is None:
+        return Response(status_code=204)
+    return latest_llm_interaction

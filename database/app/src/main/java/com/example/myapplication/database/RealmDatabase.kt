@@ -2,6 +2,7 @@ package com.example.myapplication.database
 
 import android.content.Context
 import com.example.myapplication.models.BiometricReading
+import com.example.myapplication.models.LLMInteraction
 import io.realm.kotlin.Realm
 import io.realm.kotlin.RealmConfiguration
 
@@ -11,7 +12,7 @@ object RealmDatabase {
     fun init(context: Context) {
         val encryptionKey = KeystoreManager.getRealmEncryptionKey(context)
         val config = RealmConfiguration.Builder(
-            schema = setOf(BiometricReading::class)
+            schema = setOf(BiometricReading::class, LLMInteraction::class)
         )
             .name("versalis.realm")
             .deleteRealmIfMigrationNeeded()  // remove this before production

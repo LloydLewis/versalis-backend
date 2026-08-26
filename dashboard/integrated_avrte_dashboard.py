@@ -51,7 +51,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
-
+import paho.mqtt.client as mqtt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -88,7 +88,7 @@ except Exception as exc:
     _INTENSITY_IMPORT_ERROR = str(exc)
 
 try:
-    import requests
+    import requests as _req
     HAVE_REQUESTS = True
 except ImportError:
     HAVE_REQUESTS = False
@@ -671,6 +671,32 @@ def _simulate_extra_signals(tick: int) -> dict:
         "head_movement_deg_s": float(max(0.0, head_movement)),
     }
 
+_latest_mqtt_biometric: dict = {}
+
+def _start_mqtt_subscriber():
+    def on_connect(client, userdata, flags, rc, properties=None):
+        client.subscribe("sensor/biometric")
+        print("[dashboard MQTT] subscribed to sensor/biometric")
+
+    def on_message(client, userdata, msg):
+        global _latest_mqtt_biometric
+        try:
+            _latest_mqtt_biometric = json.loads(msg.payload.decode())
+        except Exception as e:
+            print(f"[dashboard MQTT] parse error: {e}")
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect("localhost", 1883)
+    client.loop_forever()
+
+# Start subscriber in background thread on session start
+threading.Thread(target=_start_mqtt_subscriber, daemon=True).start()
+
+def fetch_latest_biometric() -> dict:
+    return _latest_mqtt_biometric
+
 
 def _feeder_loop(
     engine: AdaptiveEngine,
@@ -681,50 +707,72 @@ def _feeder_loop(
 ) -> None:
     """
     Runs in its own thread, once per second:
-      - HR/GSR come from the dataset-bootstrapped simulator if a reference
-        dataset was loaded, otherwise from the synthetic ramp fallback.
-      - speech_stress / speech_rate_wpm come from the REAL voice engine
-        whenever it has produced a reading (this is the integration point
-        that replaces the old simulated speech numbers).
-      - the full physiological signal dict is also handed to AdaptiveEngine
-        as `ml_signals`, so the trained intensity_feedback_loop.py model
-        (if loaded) can score it.
+      - Attempts to fetch live biometric data forwarded from the Android client via FastAPI.
+      - Falls back to dataset simulation or synthetic ramps if no live HTTP data is returned.
+      - Ingests real speech metrics if the VoiceBridge is active.
     """
     tick = 0
     while not stop_event.is_set():
-        if reference_df is not None and ml_bundle is not None:
-            physio = next(simulate_real_time_stream(
-                reference_df, ml_bundle.feature_columns, n_samples=1, random_state=tick,
-            ))
+        # 1. Attempt to fetch live biometric data from the FastAPI endpoint
+        live_data = fetch_latest_biometric()
+
+        # 2. Extract HR and GSR with fallbacks to dataset/simulation
+        if live_data:
+            hr = live_data.get("heartRateBpm")
+            gsr = live_data.get("gsrUs") or live_data.get("skinConductanceLevelUs")
+            speech_rate_live = live_data.get("speechRateWpm")
+            speech_stress_live = live_data.get("voiceStressScore") or live_data.get("anxietyScore")
         else:
-            physio = _simulate_physio_ramp(tick)
+            hr = None
+            gsr = None
+            speech_rate_live = None
+            speech_stress_live = None
 
-        hr = physio.get("heart_rate_bpm")
-        if hr is None or pd.isna(hr):
-            hr = 72 + min(tick / 40.0, 1.0) * 30
-        gsr = physio.get("gsr_us")
-        if gsr is None or pd.isna(gsr):
-            gsr = physio.get("skin_conductance_level_us")
-        if gsr is None or pd.isna(gsr):
-            gsr = 0.5 + min(tick / 40.0, 1.0) * 2.0
+        # Fallback to dataset or synthetic ramp if live bio data is missing
+        if hr is None or gsr is None:
+            if reference_df is not None and ml_bundle is not None:
+                physio = next(simulate_real_time_stream(
+                    reference_df, ml_bundle.feature_columns, n_samples=1, random_state=tick,
+                ))
+            else:
+                physio = _simulate_physio_ramp(tick)
 
+            if hr is None:
+                hr = physio.get("heart_rate_bpm", 72 + min(tick / 40.0, 1.0) * 30)
+            if gsr is None:
+                gsr = physio.get("gsr_us") or physio.get("skin_conductance_level_us", 0.5 + min(tick / 40.0, 1.0) * 2.0)
+        else:
+            physio = {}
+
+        # 3. Handle Voice Bridge vs. Live Payload vs. Simulation Fallback
         voice = voice_bridge.latest() if voice_bridge is not None else None
         if voice is not None:
             speech_stress = float(voice["anxiety_score"])
             speech_rate = float(voice["words_per_minute"])
+        elif speech_stress_live is not None and speech_rate_live is not None:
+            speech_stress = float(speech_stress_live)
+            speech_rate = float(speech_rate_live)
         else:
             drift = min(tick / 40.0, 1.0)
             speech_stress = float(np.clip(0.15 + drift * 0.7, 0, 1))
             speech_rate = float(max(0.0, 120 - drift * 40))
 
+        # 4. Extract secondary metrics from live data (or fallback)
         extra = _simulate_extra_signals(tick)
-        resp_rpm = physio.get("respiratory_rate_rpm")
-        resp_var = physio.get("respiratory_variability")
-        if resp_rpm is not None and not pd.isna(resp_rpm):
-            extra["respiratory_rate_rpm"] = float(resp_rpm)
-        if resp_var is not None and not pd.isna(resp_var):
-            extra["respiratory_variability"] = float(resp_var)
+        if live_data:
+            extra["respiratory_rate_rpm"] = live_data.get("respiratoryRateRpm")
+            extra["respiratory_variability"] = live_data.get("respiratoryVariability")
+            if "headMovementDegS" in live_data:
+                extra["head_movement_deg_s"] = live_data.get("headMovementDegS")
+        else:
+            resp_rpm = physio.get("respiratory_rate_rpm")
+            resp_var = physio.get("respiratory_variability")
+            if resp_rpm is not None and not pd.isna(resp_rpm):
+                extra["respiratory_rate_rpm"] = float(resp_rpm)
+            if resp_var is not None and not pd.isna(resp_var):
+                extra["respiratory_variability"] = float(resp_var)
 
+        # 5. Build biosignal object
         sample = BiosignalSample(
             timestamp=time.time(),
             heart_rate_bpm=float(hr),
@@ -743,16 +791,34 @@ def _feeder_loop(
             extra["words_recognized"] = voice.get("words_recognized_session")
             extra["transcript_delta"] = voice.get("transcript_final_delta")
             extra["transcript_partial"] = voice.get("transcript_partial")
+        elif live_data:
+            extra["pitch_hz"] = live_data.get("voiceF0Hz")
+            extra["pause_count"] = live_data.get("pauseDurationS")
 
+        # 6. Map all available signals to ML dictionary for AdaptiveEngine
         ml_signals = dict(physio)
-        ml_signals["heart_rate_bpm"] = hr
-        ml_signals["gsr_us"] = gsr
-        ml_signals["voice_stress_score"] = speech_stress
-        ml_signals["speech_rate_wpm"] = speech_rate
-        ml_signals["anxiety_score"] = speech_stress
+        if live_data:
+            # Map camelCase JSON fields to snake_case features expected by models
+            ml_signals.update({
+                "heart_rate_bpm": hr,
+                "gsr_us": gsr,
+                "voice_stress_score": speech_stress,
+                "speech_rate_wpm": speech_rate,
+                "anxiety_score": live_data.get("anxietyScore", speech_stress),
+                "respiratory_rate_rpm": live_data.get("respiratoryRateRpm"),
+                "systolic_bp_mmhg": live_data.get("systolicBpMmhg"),
+                "diastolic_bp_mmhg": live_data.get("diastolicBpMmhg"),
+                "spo2_pct": live_data.get("spo2Pct"),
+            })
+        else:
+            ml_signals["heart_rate_bpm"] = hr
+            ml_signals["gsr_us"] = gsr
+            ml_signals["voice_stress_score"] = speech_stress
+            ml_signals["speech_rate_wpm"] = speech_rate
+            ml_signals["anxiety_score"] = speech_stress
 
         engine.ingest(sample, ml_signals)
-        engine._pending_extra = extra  # picked up by the wrapper in _init_state
+        engine._pending_extra = extra
         tick += 1
         stop_event.wait(1.0)
 
@@ -872,7 +938,7 @@ def _init_state() -> None:
         st.session_state.clinical_synthesizer = synth
         shared.clinical_synthesizer = synth
 
-    if "bridge" not in st.session_state:
+    if "bridge" not in st.session_state:    
         st.session_state.bridge = UnrealBridge(
             send_fn=lambda msg: shared.add_log(f"-> Unreal: {msg}")
         )
@@ -1026,7 +1092,6 @@ def render_setup_or_dashboard() -> None:
             st.subheader("Live patient view (mirror)")
 
             try:
-                import requests as _req
                 resp = _req.get("http://127.0.0.1:8002/mirror/latest", timeout=1)
                 if resp.status_code == 200:
                     st.image(

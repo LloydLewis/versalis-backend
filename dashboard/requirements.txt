@@ -1,0 +1,19 @@
+# Core dashboard
+streamlit
+pandas
+numpy
+paho-mqtt>=2.0.0
+requests
+
+# Physiological intensity-feedback ML pipeline (intensity_feedback_loop.py)
+scikit-learn
+joblib
+openpyxl
+
+# Voice / emotion engine (analysis_engine.py) — optional, dashboard degrades
+# gracefully without it, but needed for live speech analysis
+sounddevice
+vosk
+
+# Optional EEG processing (imported in a try/except, dashboard runs without it)
+mne

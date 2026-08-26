@@ -2,11 +2,21 @@ import paho.mqtt.client as mqtt
 import pandas as pd
 import json
 import time
-
+from pathlib import Path
 print("Sensor script started")
 
 # ── Load CSV ──────────────────────────────────────────────────────────────────
-CSV_PATH = r"C:\Users\lloyd\Downloads\OneDrive_2026-07-17\Synthetic Data\synthetic_multimodal_part_01.csv"
+
+BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent.parent
+CSV_PATH = REPO_ROOT / "data" / "synthetic_multimodal_part_01.csv"
+
+# Optional check to ensure the file exists
+if not CSV_PATH.exists():
+    raise FileNotFoundError(f"Could not find CSV file at: {CSV_PATH}")
+
+# If using open() or pandas, pass CSV_PATH directly (or str(CSV_PATH))
+print(f"Loading CSV from: {CSV_PATH}")
 
 # Only load the columns that map to BiometricReading
 REQUIRED_COLUMNS = [

@@ -14,8 +14,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.myapplication.database.RealmDatabase
 import com.example.myapplication.models.BiometricReading
+import com.example.myapplication.models.LLMInteraction
 import com.example.myapplication.mqtt.BioDataSubscriber
 import com.example.myapplication.repository.BioDataRepository
+import com.example.myapplication.server.LlmInteractionServer
 import io.realm.kotlin.ext.query
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -27,6 +29,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var subscriber: BioDataSubscriber
     private lateinit var bioDataRepository: BioDataRepository
+    private lateinit var llmInteractionServer: LlmInteractionServer
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -34,7 +37,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             var isReady by remember { mutableStateOf(false) }
             var queryResult by remember { mutableStateOf("") }
+            var llmResult by remember { mutableStateOf("") }
             var latestReading by remember { mutableStateOf("Waiting for MQTT data...") }
+            var latestLLM by remember { mutableStateOf("No LLM interactions yet") }
 
             LaunchedEffect(Unit) {
                 kotlinx.coroutines.withContext(Dispatchers.IO) {
@@ -42,6 +47,8 @@ class MainActivity : ComponentActivity() {
                     bioDataRepository = BioDataRepository()
                     subscriber = BioDataSubscriber(bioDataRepository)
                     subscriber.connect()
+                    llmInteractionServer = LlmInteractionServer(bioDataRepository)
+                    llmInteractionServer.start()
                 }
                 isReady = true
             }
@@ -58,6 +65,8 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             } else {
+
+                // Live biometric poll — updates every second
                 LaunchedEffect(Unit) {
                     while (true) {
                         val latest = bioDataRepository.getLatestReading()
@@ -71,6 +80,25 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // Live LLM poll — updates every 2 seconds
+                LaunchedEffect(Unit) {
+                    while (true) {
+                        val interactions = RealmDatabase.realm
+                            .query<LLMInteraction>()
+                            .find()
+                        latestLLM = if (interactions.isNotEmpty()) {
+                            val last = interactions.last()
+                            "Patient: \"${last.patientText}\"\n" +
+                                    "Therapist: \"${last.therapistReply}\"\n" +
+                                    "Flagged: ${last.wasGuardFlagged} | " +
+                                    "Latency: ${last.latencyMs}ms"
+                        } else {
+                            "No LLM interactions yet"
+                        }
+                        delay(2000.milliseconds)
+                    }
+                }
+
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -79,7 +107,9 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text("MQTT -> Realm", fontSize = 22.sp)
+
+                    // ── Biometric section ─────────────────────────────────
+                    Text("MQTT -> Realm (Biometrics)", fontSize = 22.sp)
 
                     Spacer(modifier = Modifier.height(12.dp))
 
@@ -154,25 +184,87 @@ class MainActivity : ComponentActivity() {
 
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    Button(onClick = {
-                        CoroutineScope(Dispatchers.IO).launch {
-                            RealmDatabase.realm.write {
-                                deleteAll()
-                            }
-                            queryResult = "Database cleared"
-                        }
-                    }) {
-                        Text("Clear Database")
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
                     Text(
                         text = queryResult,
                         fontSize = 13.sp,
                         lineHeight = 18.sp,
                         modifier = Modifier.fillMaxWidth()
                     )
+
+                    Spacer(modifier = Modifier.height(24.dp))
+                    HorizontalDivider()
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    // ── LLM Interactions section ──────────────────────────
+                    Text("LLM Interactions -> Realm", fontSize = 22.sp)
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Live latest interaction — updates every 2 seconds
+                    Text(
+                        text = latestLLM,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Read all stored interactions
+                    Button(onClick = {
+                        CoroutineScope(Dispatchers.IO).launch {
+                            val interactions = RealmDatabase.realm
+                                .query<LLMInteraction>()
+                                .find()
+
+                            llmResult = if (interactions.isEmpty()) {
+                                "No LLM interactions stored yet"
+                            } else {
+                                buildString {
+                                    appendLine("Total interactions: ${interactions.size}")
+                                    appendLine("─────────────────────")
+                                    // Show last 5 interactions
+                                    interactions.takeLast(5).forEach { interaction ->
+                                        appendLine("Session: ${interaction.sessionId}")
+                                        appendLine("Patient:   \"${interaction.patientText}\"")
+                                        appendLine("Therapist: \"${interaction.therapistReply}\"")
+                                        appendLine("Flagged: ${interaction.wasGuardFlagged}")
+                                        appendLine("Latency: ${interaction.latencyMs}ms")
+                                        appendLine("Model: ${interaction.modelUsed}")
+                                        appendLine("─────────────────────")
+                                    }
+                                }
+                            }
+                        }
+                    }) {
+                        Text("Read LLM Interactions")
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Text(
+                        text = llmResult,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(24.dp))
+                    HorizontalDivider()
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    // ── Clear database ────────────────────────────────────
+                    Button(onClick = {
+                        CoroutineScope(Dispatchers.IO).launch {
+                            RealmDatabase.realm.write {
+                                deleteAll()
+                            }
+                            queryResult = "Database cleared"
+                            llmResult = ""
+                        }
+                    }) {
+                        Text("Clear Database")
+                    }
 
                     Spacer(modifier = Modifier.height(32.dp))
                 }
@@ -183,6 +275,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         subscriber.disconnect()
+        llmInteractionServer.stop()
         RealmDatabase.realm.close()
     }
 }
