@@ -3,7 +3,7 @@ import asyncio
 import httpx
 
 # --- Configuration ---
-CHAT_MODEL = "llama3.2:1b"  # ~1.3GB - UE+ASR+TTS baseline alone eats ~4.2GB of this 8GB GPU, so every GB back here matters. Ensure this matches 'ollama list'
+CHAT_MODEL = "llama3.1:8b-instruct-q4_k_m"  # Ensure this matches 'ollama list'
 GUARD_MODEL = "llama-guard3:1b"
 ollama_url = "http://localhost:11434/api/chat"
 
@@ -61,11 +61,11 @@ async def call_ollama(client: httpx.AsyncClient, model: str, messages: list[dict
         "model": model,
         "messages": messages,
         "stream": False,
-        "keep_alive": "60m",  # keeps the model warm between turns instead of reloading
+        "keep_alive": "10m",  # keeps the model warm between turns instead of reloading
     }
     if options:
         payload["options"] = options
-    r = await client.post(ollama_url, json=payload, timeout=90)  # generous headroom - GPU is shared with UE/ASR/TTS and can be saturated
+    r = await client.post(ollama_url, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()["message"]["content"].strip()
 
@@ -135,7 +135,7 @@ async def ask_question_async(user_text: str) -> str:
         #    must stay sequential (not concurrent): running two Ollama model instances
         #    at once here doesn't parallelize, it thrashes the GPU scheduler (observed:
         #    prompt eval falling from ~24 tok/s to well under 1 tok/s under concurrent
-        #    load, blowing past the 90s timeout below).
+        #    load, blowing past the timeout below).
         model_reply = finish_sentence(await call_ollama(
             client, CHAT_MODEL,
             [{"role": "system", "content": system_prompt},
