@@ -6,7 +6,7 @@ import os
 import httpx
 import time
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'llmsegment'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'llmsegment'))
 
 from aisegment import ask_question_async
 
@@ -52,6 +52,9 @@ def make_openai_response(reply: str, was_flagged: bool) -> dict:
 # ── Main endpoint ─────────────────────────────────────────────────────────────
 
 @app.post("/chat/completions")
+@app.post("/v1/chat/completions")  # alias — some clients (e.g. NVIDIA ACE's
+                                    # BP_ASR_Debug) default to the OpenAI-standard
+                                    # /v1/ prefixed path
 async def chat_completions(request: OpenAIRequest):
     # Extract the last user message
     patient_text = ""

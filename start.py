@@ -1,9 +1,26 @@
 import os
+import shutil
 import subprocess
 import sys
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def find_mosquitto():
+    """Resolve the mosquitto executable: PATH first, then the default install location.
+
+    On Windows, mosquitto is often installed as a service (C:\\Program Files\\Mosquitto)
+    without ever being added to PATH, so a plain Popen(["mosquitto", ...]) silently
+    fails with FileNotFoundError and start_service() just prints an easy-to-miss error.
+    """
+    exe = shutil.which("mosquitto")
+    if exe:
+        return exe
+    default = r"C:\Program Files\mosquitto\mosquitto.exe"
+    if os.path.exists(default):
+        return default
+    return None
 
 
 def start_service(name, cmd, cwd=None, delay=2):
@@ -37,7 +54,7 @@ print()
 # ── Paths ───────────────────────────────────────────────────
 bridge_dir     = os.path.join(ROOT, "bridge")
 mqtt_dir       = os.path.join(ROOT, "database", "mqtt")
-llm_dir        = os.path.join(ROOT, "unreal", "server")
+llm_dir        = os.path.join(ROOT, "unreal", "LLM")
 dashboard_dir  = os.path.join(ROOT, "dashboard")
 
 # ── Pre-flight checks ───────────────────────────────────────
@@ -45,7 +62,7 @@ print("Pre-flight checks...")
 
 all_ok = True
 all_ok &= check_file(os.path.join(bridge_dir,    "main.py"),           "bridge/main.py")
-all_ok &= check_file(os.path.join(llm_dir,       "server.py"),         "unreal/server/server.py")
+all_ok &= check_file(os.path.join(llm_dir,       "server.py"),         "unreal/LLM/server.py")
 all_ok &= check_file(os.path.join(mqtt_dir,      "sensor.py"),         "database/mqtt/sensor.py")
 all_ok &= check_file(os.path.join(mqtt_dir,      "mosquitto.conf"),    "database/mqtt/mosquitto.conf")
 all_ok &= check_file(
@@ -110,12 +127,20 @@ start_service(
 )
 
 # 5. Mosquitto MQTT broker
-start_service(
-    name  = "Mosquitto broker",
-    cmd   = ["mosquitto", "-v", "-c", "mosquitto.conf"],
-    cwd   = mqtt_dir,
-    delay = 2
-)
+mosquitto_exe = find_mosquitto()
+if mosquitto_exe:
+    start_service(
+        name  = "Mosquitto broker",
+        cmd   = [mosquitto_exe, "-v", "-c", "mosquitto.conf"],
+        cwd   = mqtt_dir,
+        delay = 2
+    )
+else:
+    print("  [Mosquitto broker] mosquitto.exe not found on PATH or in the default")
+    print("           install location (C:\\Program Files\\mosquitto). If it's already")
+    print("           running as a Windows service, this is fine — skipping.")
+    print("           Otherwise, install it or add it to PATH, then start it manually:")
+    print("           Start-Service mosquitto")
 
 # 6. Biofeedback sensor simulator
 # Reads the PsycReality CSV and publishes biometric readings to Mosquitto

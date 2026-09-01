@@ -8,15 +8,14 @@ GUARD_MODEL = "llama-guard3:1b"
 ollama_url = "http://localhost:11434/api/chat"
 
 system_prompt = (
-    "You are a warm, present clinical therapist in a VR session, speaking out loud in real time. "
-    "Talk the way a real therapist talks in person. "
-    "never a list or a paragraph. "
+    "You are a warm, present clinical therapist in a VR session. "
+    "Respond the way a human therapist speaks out loud: ONE short sentence only. "
     "Take the patient's stated feelings at face value — do not contradict, "
     "reinterpret, or suggest they feel differently than what they said. "
     "If the patient asks for space or says they don't want to talk, respect that "
     "immediately and let them lead — do not press further or re-open the topic. "
+    "Be deeply conversational, with no lists, no explanations, and no paragraphs. "
     "Maintain strict professional boundaries, and never give a medical diagnosis."
-    "You are a Real Human Therapist and talk like one and never mention that you are virtual or a computer, you are totally and entirely human to them."
 )
 
 SELF_HARM_RE = re.compile(
@@ -27,29 +26,33 @@ SELF_HARM_RE = re.compile(
 CLINICIAN_OVERRIDE_MESSAGE = "I'm right here with you, and I'm getting your care team connected now."
 SAFE_FALLBACK_MESSAGE = "Let's pause for a moment — I'm here whenever you're ready."
 
-def compute_gen_options(user_text: str) -> dict:
-    """
-    Scales the model's response budget to the patient's input, instead of
-    using one fixed number for every turn — this is what actually makes
-    replies feel proportionate, the way a human adjusts a one-word reply
-    for "im fine" vs a longer one for something the patient opened up about.
+# Generation options tuned for speed + single-sentence brevity
+GEN_OPTIONS = {
+    "num_predict": 40,          # hard cap so it can't ramble even if it misses the stop token
+    "temperature": 0.6,
+    "stop": [".", "!", "?"],    # stop at the first sentence-ending punctuation
+    "num_ctx": 1024,            # smaller context window = faster prompt processing per turn
+}
 
-    num_predict is a TOKEN budget, not a sentence count — it's a ceiling,
-    not a target. The model can (and usually will) stop earlier on its own.
-    We still cap it because an ungoverned local model can occasionally
-    ramble into a paragraph, which is both a latency and a safety risk here.
-    """
-    word_count = len(user_text.split())
-    # short patient input -> short budget, longer input -> a bit more room,
-    # but always clamped so it can never balloon into an essay
-    num_predict = max(20, min(90, word_count * 6))
+# --- Conversational state ---
+# The UE side calls this endpoint once per user utterance with no message history of its
+# own (SendACEASRLLMMessage is single-turn by design), so continuity across a conversation
+# has to live here. Cleared automatically the moment a conversation ends (see
+# ask_question_async) - the next call after that starts a fresh conversation.
+conversation_history: list[dict] = []
+MAX_HISTORY_MESSAGES = 12  # 6 turns of context - num_ctx=1024 doesn't leave room for more
 
-    return {
-        "num_predict": num_predict,
-        "temperature": 0.6,
-        "stop": ["\n\n"],   # only guard against it drifting into a new paragraph/list
-        "num_ctx": 1024,
-    }
+# UE strips this out of the reply before it's ever spoken or shown - it's the only channel
+# the LLM has to say "end the conversation now", since the ACE bridge only returns plain
+# reply text (no room for a separate structured field). See decide_should_end below.
+END_CONVERSATION_MARKER = "[[END_SESSION]]"
+
+END_DECISION_OPTIONS = {
+    "num_predict": 4,
+    "temperature": 0.0,
+    "stop": ["\n"],
+    "num_ctx": 512,
+}
 
 # --- Core Logic ---
 
@@ -74,71 +77,90 @@ def check_llama_guard_verdict(verdict: str) -> tuple[bool, str | None]:
     return False, (lines[1] if len(lines) > 1 else "unknown")
 
 
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+def finish_sentence(text: str) -> str:
+    """Ollama's `stop` strings are excluded from output, so re-add closing punctuation."""
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
 
 
-def trim_to_conversational_length(text: str, user_text: str) -> str:
+async def decide_should_end(client: httpx.AsyncClient, history: list[dict]) -> bool:
     """
-    Safety net independent of prompt-following: even if the model ignores
-    instructions and rambles, this guarantees the reply stays human-sized
-    and roughly proportionate to what the patient said, rather than a
-    fixed sentence count for every turn.
+    A small, dedicated decision call - deliberately separate from the main reply
+    generation, since GEN_OPTIONS stops generation at the first sentence-ending
+    punctuation and could never fit a trailing marker in that same pass.
+    Kept last so it never runs during a self-harm override or a guard-blocked
+    exchange - a conversation never auto-ends on our own safety-fallback lines.
     """
-    text = text.strip()
-    if not text:
-        return text
+    convo_text = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
+    verdict = await call_ollama(
+        client, CHAT_MODEL,
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are monitoring a therapy conversation transcript. Reply with "
+                    "exactly one word. Say END if the patient has said goodbye, said they "
+                    "want to stop, or the conversation has clearly reached a natural close. "
+                    "Otherwise say CONTINUE."
+                ),
+            },
+            {"role": "user", "content": convo_text},
+        ],
+        options=END_DECISION_OPTIONS,
+    )
+    return verdict.strip().upper().startswith("END")
 
-    # A brief patient message gets at most 1 sentence back; a longer,
-    # more open message allows up to 2 — mirrors natural conversation pacing.
-    max_sentences = 1 if len(user_text.split()) <= 6 else 2
 
-    sentences = [s for s in SENTENCE_SPLIT_RE.split(text) if s]
-    trimmed = " ".join(sentences[:max_sentences]).strip()
-    if trimmed and trimmed[-1] not in ".!?":
-        trimmed += "."
-    return trimmed
+def _remember_turn(user_text: str, reply: str) -> None:
+    conversation_history.append({"role": "user", "content": user_text})
+    conversation_history.append({"role": "assistant", "content": reply})
+    del conversation_history[:-MAX_HISTORY_MESSAGES]
 
 
 async def ask_question_async(user_text: str) -> str:
-    # 1. Immediate hard-coded self-harm override — no model latency, checked first
+    # 1. Immediate hard-coded self-harm override — no model latency, checked first.
+    # Never ends the conversation - a crisis moment should never auto-close the session.
     if SELF_HARM_RE.search(user_text):
+        _remember_turn(user_text, CLINICIAN_OVERRIDE_MESSAGE)
         return CLINICIAN_OVERRIDE_MESSAGE
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # 2. Run input-guard check and generation concurrently (optimistic concurrency).
-        #    If the guard flags the input as unsafe, we discard the generation result
-        #    instead of waiting for both calls serially.
-        guard_task = asyncio.create_task(
-            call_ollama(client, GUARD_MODEL, [{"role": "user", "content": user_text}])
-        )
-        gen_task = asyncio.create_task(
-            call_ollama(
-                client, CHAT_MODEL,
-                [{"role": "system", "content": system_prompt},
-                 {"role": "user", "content": user_text}],
-                options=compute_gen_options(user_text),
-            )
-        )
+        # 2. Generate first, then run ONE guard pass over the finished exchange (user
+        #    input + assistant reply) instead of separate input/output guard calls.
+        #    Llama Guard classifies a whole conversation turn at once, so a single
+        #    post-generation check gives the same guarantee - nothing unsafe ever
+        #    reaches the user - for one fewer full Ollama round-trip per turn. This
+        #    GPU is shared with UE/ASR/TTS and has no headroom to spare, and calls
+        #    must stay sequential (not concurrent): running two Ollama model instances
+        #    at once here doesn't parallelize, it thrashes the GPU scheduler (observed:
+        #    prompt eval falling from ~24 tok/s to well under 1 tok/s under concurrent
+        #    load, blowing past the timeout below).
+        model_reply = finish_sentence(await call_ollama(
+            client, CHAT_MODEL,
+            [{"role": "system", "content": system_prompt},
+             *conversation_history,
+             {"role": "user", "content": user_text}],
+            options=GEN_OPTIONS,
+        ))
 
-        guard_verdict = await guard_task
-        input_safe, input_category = check_llama_guard_verdict(guard_verdict)
-        if not input_safe:
-            gen_task.cancel()
-            print(f"[guardrails] blocked input, category: {input_category}")
-            return SAFE_FALLBACK_MESSAGE
-
-        model_reply = trim_to_conversational_length(await gen_task, user_text)
-
-        # 3. Output gate — check the model's actual reply before showing it to the patient
-        output_verdict = await call_ollama(
+        guard_verdict = await call_ollama(
             client, GUARD_MODEL,
             [{"role": "user", "content": user_text},
              {"role": "assistant", "content": model_reply}],
         )
-        output_safe, output_category = check_llama_guard_verdict(output_verdict)
-        if not output_safe:
-            print(f"[guardrails] blocked output, category: {output_category}")
+        exchange_safe, category = check_llama_guard_verdict(guard_verdict)
+        if not exchange_safe:
+            print(f"[guardrails] blocked exchange, category: {category}")
+            _remember_turn(user_text, SAFE_FALLBACK_MESSAGE)
             return SAFE_FALLBACK_MESSAGE
+
+        _remember_turn(user_text, model_reply)
+
+        # 3. Only the LLM decides whether the conversation is over.
+        if await decide_should_end(client, conversation_history):
+            conversation_history.clear()
+            return f"{model_reply} {END_CONVERSATION_MARKER}"
 
         return model_reply
 
